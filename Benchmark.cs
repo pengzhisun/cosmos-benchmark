@@ -1,44 +1,41 @@
 using Microsoft.Azure.Documents;
 using Microsoft.Azure.Documents.Client;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
 public class Benchmark
 {
+    private List<object> DocumentsList = null;
+
     private int pendingTaskCount;
     private long documentsInserted;
+
     private ConcurrentDictionary<int, double> requestUnitsConsumed = new ConcurrentDictionary<int, double>();
 
-    private static List<Guid> potentialDeviceIds = Enumerable.Range(0, 200).Select(d => Guid.NewGuid()).ToList<Guid>();
-    private static List<Guid> potentialLocationIds = Enumerable.Range(0, 10).Select(d => Guid.NewGuid()).ToList<Guid>();
+    public void InitStudentList(CollectionSettings collectionSetting)
+    {
+        string fileContent = File.ReadAllText(collectionSetting.DataFilePath, Encoding.UTF8);
 
-    private Bogus.Faker<DeviceRecording> recordingGenerator = new Bogus.Faker<DeviceRecording>().Rules(
-        (faker, recording) =>
-        {
-            recording.Version = 1.0d;
-            recording.DeviceId = faker.PickRandom(potentialDeviceIds);
-            recording.LocationId = faker.PickRandom(potentialLocationIds);
-            recording.DeviceLocationComposite = $"{recording.DeviceId}_{recording.LocationId}";
-            DateTime submitTime = DateTime.Now;
-            recording.SubmitDay = submitTime.ToString("yyyy-MM-dd");
-            recording.SubmitHour = submitTime.ToString("yyyy-MM-dd-HH");
-            recording.SubmitMinute = submitTime.ToString("yyyy-MM-dd-HH-mm");
-            recording.SubmitSecond = submitTime.ToString("yyyy-MM-dd-HH-mm-ss");
-            recording.TemperatureCelsius = faker.Random.Double(20, 25);
-            recording.Humidity = faker.Random.Double(0.1d, 0.25d);
-        }
-    );
+        JArray jsonArray = JsonConvert.DeserializeObject<JArray>(fileContent);
+
+        DocumentsList = jsonArray.OfType<object>().ToList();
+    }
 
     public async Task StartBenchmarkAsync(DocumentClient client, ConnectionPolicy policy, CosmosSettings settings, CollectionSettings collectionSetting)
     {
+        InitStudentList(collectionSetting);
+
         await client.OpenAsync();
 
         Database database = await EnsureDatabaseResourceAsync(client, settings.Database);
@@ -70,12 +67,12 @@ public class Benchmark
     }
 
     public async Task BenchmarkCollectionAsync(DocumentClient client, DocumentCollection collection, int numberOfDocumentsToInsert, int taskCount)
-    {           
+    {
         int minThreadPoolSize = 100;
         ThreadPool.SetMinThreads(minThreadPoolSize, minThreadPoolSize);
 
         await Console.Out.WriteLineAsync($"Starting Inserts with {taskCount} tasks");
-        
+
         pendingTaskCount = taskCount;
         List<Task> tasks = new List<Task>();
         tasks.Add(
@@ -85,21 +82,25 @@ public class Benchmark
         for (int i = 0; i < taskCount; i++)
         {
             tasks.Add(
-                InsertDocumentAsync(i, client, collection, numberOfDocumentsToInsert / taskCount)
+                InsertDocumentAsync(i, client, collection, numberOfDocumentsToInsert, taskCount)
             );
         }
 
         await Task.WhenAll(tasks);
     }
 
-    public async Task InsertDocumentAsync(int taskId, DocumentClient client, DocumentCollection collection, int numberOfDocumentsToInsert)
-    {            
+    public async Task InsertDocumentAsync(int taskId, DocumentClient client, DocumentCollection collection, int numberOfDocumentsToInsert, int taskCount)
+    {
         requestUnitsConsumed[taskId] = 0;
         string partitionKeyProperty = collection.PartitionKey.Paths[0].Replace("/", "");
 
-        for (int i = 0; i < numberOfDocumentsToInsert; i++)
+        int sliceSize = numberOfDocumentsToInsert / taskCount;
+        int offset = sliceSize * taskId;
+
+        for (int i = 0; i < sliceSize; i++)
         {
-            DeviceRecording document = recordingGenerator.Generate();
+            var document = this.DocumentsList[offset + i];
+
             try
             {
                 ResourceResponse<Document> response = await client.CreateDocumentAsync(collection.SelfLink, document);
@@ -193,12 +194,28 @@ public class Benchmark
             PartitionKey = new PartitionKeyDefinition
             {
                 Paths = new Collection<string>(collectionSetting.PartitionKeys)
-            } 
+            }
         };
+
+        if (collectionSetting.UniqueKeys != null && collectionSetting.UniqueKeys.Any())
+        {
+            collection.UniqueKeyPolicy = new UniqueKeyPolicy
+            {
+                UniqueKeys = new Collection<UniqueKey>
+                {
+                    new UniqueKey
+                    {
+                        Paths = new Collection<string>(collectionSetting.UniqueKeys)
+                    }
+                }
+            };
+        }
+
         RequestOptions options = new RequestOptions
         {
             OfferThroughput = collectionSetting.Throughput
         };
+
         collection = await client.CreateDocumentCollectionIfNotExistsAsync(database.SelfLink, collection, options);
 
         return collection;
